@@ -42,9 +42,7 @@ class LiveKitTransport @Inject constructor(
                 room = newRoom
                 
                 scope.launch {
-                    @Suppress("UNCHECKED_CAST")
-                    val eventsFlow = newRoom.events as Flow<RoomEvent>
-                    eventsFlow.collect { event ->
+                    newRoom.events.events.collect { event ->
                         when (event) {
                             is RoomEvent.Connected -> {
                                 _state.value = TransportState.CONNECTED
