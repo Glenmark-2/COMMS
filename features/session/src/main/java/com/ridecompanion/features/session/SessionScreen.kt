@@ -5,8 +5,14 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -26,6 +32,7 @@ fun SessionScreen(
     onNavigateToRideDashboard: (sessionId: String) -> Unit
 ) {
     val uiState by viewModel.uiState.collectAsState()
+    val isServerOnline by viewModel.isServerOnline.collectAsState()
     
     var riderName by remember { mutableStateOf("") }
     var sessionName by remember { mutableStateOf("") }
@@ -46,9 +53,9 @@ fun SessionScreen(
                 Brush.verticalGradient(
                     colors = listOf(Color(0xFF0C0F1D), Color(0xFF07080F))
                 )
-            ),
-        contentAlignment = Alignment.Center
+            )
     ) {
+        // Decorative background glow elements
         Box(
             modifier = Modifier
                 .size(300.dp)
@@ -64,144 +71,201 @@ fun SessionScreen(
                 .background(Color(0x0C3D5AFE), shape = RoundedCornerShape(200.dp))
         )
 
+        // Main layout container
         Column(
             modifier = Modifier
-                .fillMaxWidth(0.9f)
-                .clip(RoundedCornerShape(24.dp))
-                .background(Color(0x0F2E3047))
-                .border(1.dp, Color(0x1Fffffff), RoundedCornerShape(24.dp))
-                .padding(28.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.SpaceBetween
         ) {
-            Text(
-                text = "RIDE COMPANION",
-                fontSize = 28.sp,
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.SansSerif,
-                color = Color(0xFF00E5FF),
-                letterSpacing = 2.sp
-            )
-            
-            Text(
-                text = "Secure intercom for cycling groups",
-                fontSize = 13.sp,
-                color = Color(0xFF8A90A6),
-                modifier = Modifier.padding(top = 4.dp, bottom = 24.dp)
-            )
+            // Server Connection Status Indicator
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color(0xCC0C0D14))
+                    .border(1.dp, Color(0x1Fffffff), RoundedCornerShape(12.dp))
+                    .clickable { viewModel.checkServerStatus() }
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                val (statusText, statusColor, statusIcon) = when (isServerOnline) {
+                    true -> Triple("Server Online", Color(0xFF00E676), Icons.Default.Cloud)
+                    false -> Triple("Server Offline (Tap to Retry)", Color(0xFFFF5252), Icons.Default.CloudOff)
+                    null -> Triple("Checking server…", Color(0xFFFFAB40), Icons.Default.Refresh)
+                }
 
-            OutlinedTextField(
-                value = riderName,
-                onValueChange = { riderName = it },
-                label = { Text("Your Name", color = Color(0xFF8A90A6)) },
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedTextColor = Color.White,
-                    unfocusedTextColor = Color.White,
-                    focusedBorderColor = Color(0xFF00E5FF),
-                    unfocusedBorderColor = Color(0x3Dffffff),
-                    focusedContainerColor = Color(0x08ffffff),
-                    unfocusedContainerColor = Color(0x04ffffff)
-                ),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            if (isCreateMode) {
-                OutlinedTextField(
-                    value = sessionName,
-                    onValueChange = { sessionName = it },
-                    label = { Text("Ride Name", color = Color(0xFF8A90A6)) },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White,
-                        focusedBorderColor = Color(0xFF00E5FF),
-                        unfocusedBorderColor = Color(0x3Dffffff),
-                        focusedContainerColor = Color(0x08ffffff),
-                        unfocusedContainerColor = Color(0x04ffffff)
-                    ),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
+                Icon(
+                    imageVector = statusIcon,
+                    contentDescription = "Server Connection Status",
+                    tint = statusColor,
+                    modifier = Modifier.size(16.dp)
                 )
-            } else {
-                OutlinedTextField(
-                    value = sessionIdToJoin,
-                    onValueChange = { sessionIdToJoin = it },
-                    label = { Text("Session ID", color = Color(0xFF8A90A6)) },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White,
-                        focusedBorderColor = Color(0xFF00E5FF),
-                        unfocusedBorderColor = Color(0x3Dffffff),
-                        focusedContainerColor = Color(0x08ffffff),
-                        unfocusedContainerColor = Color(0x04ffffff)
-                    ),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
+
+                Text(
+                    text = statusText,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = statusColor
                 )
             }
 
-            Spacer(modifier = Modifier.height(28.dp))
-
-            Button(
-                onClick = {
-                    if (isCreateMode) {
-                        viewModel.createSession(sessionName, riderName)
-                    } else {
-                        viewModel.joinSession(sessionIdToJoin, riderName)
-                    }
-                },
-                enabled = riderName.isNotBlank() && (if (isCreateMode) sessionName.isNotBlank() else sessionIdToJoin.isNotBlank()) && uiState !is SessionUiState.Loading,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFF00E5FF),
-                    disabledContainerColor = Color(0x1F00E5FF),
-                    contentColor = Color(0xFF060913),
-                    disabledContentColor = Color(0x3Dffffff)
-                ),
-                shape = RoundedCornerShape(12.dp),
+            // Main form card
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(50.dp)
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(Color(0x0F2E3047))
+                    .border(1.dp, Color(0x1Fffffff), RoundedCornerShape(24.dp))
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                if (uiState is SessionUiState.Loading) {
-                    CircularProgressIndicator(color = Color(0xFF060913), modifier = Modifier.size(24.dp))
+                Text(
+                    text = "RIDE COMPANION",
+                    fontSize = 28.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.SansSerif,
+                    color = Color(0xFF00E5FF),
+                    letterSpacing = 2.sp
+                )
+                
+                Text(
+                    text = "Secure intercom for cycling groups",
+                    fontSize = 13.sp,
+                    color = Color(0xFF8A90A6),
+                    modifier = Modifier.padding(top = 4.dp, bottom = 24.dp)
+                )
+
+                OutlinedTextField(
+                    value = riderName,
+                    onValueChange = { riderName = it },
+                    label = { Text("Your Name", color = Color(0xFF8A90A6)) },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = Color(0xFF00E5FF),
+                        unfocusedBorderColor = Color(0x3Dffffff),
+                        focusedContainerColor = Color(0x08ffffff),
+                        unfocusedContainerColor = Color(0x04ffffff)
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                if (isCreateMode) {
+                    OutlinedTextField(
+                        value = sessionName,
+                        onValueChange = { sessionName = it },
+                        label = { Text("Ride Name", color = Color(0xFF8A90A6)) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Color(0xFF00E5FF),
+                            unfocusedBorderColor = Color(0x3Dffffff),
+                            focusedContainerColor = Color(0x08ffffff),
+                            unfocusedContainerColor = Color(0x04ffffff)
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
                 } else {
+                    OutlinedTextField(
+                        value = sessionIdToJoin,
+                        onValueChange = { sessionIdToJoin = it },
+                        label = { Text("Session ID", color = Color(0xFF8A90A6)) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Color(0xFF00E5FF),
+                            unfocusedBorderColor = Color(0x3Dffffff),
+                            focusedContainerColor = Color(0x08ffffff),
+                            unfocusedContainerColor = Color(0x04ffffff)
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                Button(
+                    onClick = {
+                        if (isCreateMode) {
+                            viewModel.createSession(sessionName, riderName)
+                        } else {
+                            viewModel.joinSession(sessionIdToJoin, riderName)
+                        }
+                    },
+                    enabled = riderName.isNotBlank() && 
+                            (if (isCreateMode) sessionName.isNotBlank() else sessionIdToJoin.isNotBlank()) && 
+                            uiState !is SessionUiState.Loading &&
+                            isServerOnline == true,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF00E5FF),
+                        disabledContainerColor = Color(0x1F00E5FF),
+                        contentColor = Color(0xFF060913),
+                        disabledContentColor = Color(0x3Dffffff)
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp)
+                ) {
+                    if (uiState is SessionUiState.Loading) {
+                        CircularProgressIndicator(color = Color(0xFF060913), modifier = Modifier.size(24.dp))
+                    } else {
+                        Text(
+                            text = if (isCreateMode) "CREATE RIDE" else "JOIN RIDE",
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 1.sp
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                TextButton(
+                    onClick = { isCreateMode = !isCreateMode },
+                    colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFF8A90A6))
+                ) {
                     Text(
-                        text = if (isCreateMode) "CREATE RIDE" else "JOIN RIDE",
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 1.sp
+                        text = if (isCreateMode) "Switch to Join Ride" else "Switch to Create Ride",
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+
+                AnimatedVisibility(
+                    visible = uiState is SessionUiState.Error,
+                    enter = fadeIn(),
+                    exit = fadeOut()
+                ) {
+                    val errorMsg = (uiState as? SessionUiState.Error)?.message ?: ""
+                    Text(
+                        text = errorMsg,
+                        color = Color(0xFFFF5252),
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(top = 16.dp)
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
-
-            TextButton(
-                onClick = { isCreateMode = !isCreateMode },
-                colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFF8A90A6))
-            ) {
-                Text(
-                    text = if (isCreateMode) "Switch to Join Ride" else "Switch to Create Ride",
-                    fontWeight = FontWeight.Medium
-                )
-            }
-
-            AnimatedVisibility(
-                visible = uiState is SessionUiState.Error,
-                enter = fadeIn(),
-                exit = fadeOut()
-            ) {
-                val errorMsg = (uiState as? SessionUiState.Error)?.message ?: ""
-                Text(
-                    text = errorMsg,
-                    color = Color(0xFFFF5252),
-                    fontSize = 13.sp,
-                    modifier = Modifier.padding(top = 16.dp)
-                )
-            }
+            // Bottom brand tagline / spacer to balance layout
+            Text(
+                text = "Version 1.0.0",
+                fontSize = 11.sp,
+                color = Color(0xFF333D52),
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 1.sp,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
         }
     }
 }

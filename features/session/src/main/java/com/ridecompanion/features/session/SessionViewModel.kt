@@ -33,6 +33,25 @@ class SessionViewModel @Inject constructor(
     private val _uiState = MutableStateFlow<SessionUiState>(SessionUiState.Idle)
     val uiState: StateFlow<SessionUiState> = _uiState
 
+    private val _isServerOnline = MutableStateFlow<Boolean?>(null)
+    val isServerOnline: StateFlow<Boolean?> = _isServerOnline
+
+    init {
+        checkServerStatus()
+    }
+
+    fun checkServerStatus() {
+        _isServerOnline.value = null
+        viewModelScope.launch {
+            try {
+                rideApi.checkHealth()
+                _isServerOnline.value = true
+            } catch (e: Exception) {
+                _isServerOnline.value = false
+            }
+        }
+    }
+
     fun createSession(sessionName: String, riderName: String) {
         _uiState.value = SessionUiState.Loading
         viewModelScope.launch {

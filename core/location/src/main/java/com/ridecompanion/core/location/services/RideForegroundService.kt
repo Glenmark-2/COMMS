@@ -44,6 +44,9 @@ class RideForegroundService : Service() {
     @Inject
     lateinit var transportManager: AdaptiveTransportManager
 
+    @Inject
+    lateinit var locationBroadcaster: LocationBroadcaster
+
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     
     private lateinit var fusedLocationClient: FusedLocationProviderClient
@@ -157,6 +160,9 @@ class RideForegroundService : Service() {
         val sessionId = currentSessionId ?: return
         
         serviceScope.launch {
+            // Broadcast to UI (MapViewModel etc.)
+            locationBroadcaster.broadcast(location)
+
             val point = GPSPointEntity(
                 sessionId = sessionId,
                 latitude = location.latitude,

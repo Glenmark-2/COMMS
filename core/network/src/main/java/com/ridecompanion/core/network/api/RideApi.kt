@@ -1,8 +1,14 @@
 package com.ridecompanion.core.network.api
 
 import retrofit2.http.Body
+import retrofit2.http.GET
 import retrofit2.http.POST
 import retrofit2.http.Path
+
+data class HealthResponse(
+    val status: String,
+    val sessions: Int
+)
 
 data class CreateSessionRequest(
     val name: String,
@@ -46,4 +52,7 @@ interface RideApi {
         @Path("sessionId") sessionId: String,
         @Body request: UpdateDestinationRequest
     )
+
+    @GET("/")
+    suspend fun checkHealth(): HealthResponse
 }

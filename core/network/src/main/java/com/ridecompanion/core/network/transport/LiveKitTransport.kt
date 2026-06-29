@@ -1,16 +1,12 @@
 package com.ridecompanion.core.network.transport
 
 import android.content.Context
+import android.util.Log
 import io.livekit.android.LiveKit
 import io.livekit.android.room.Room
 import io.livekit.android.events.RoomEvent
+import io.livekit.android.events.collect
 import io.livekit.android.room.track.DataPublishReliability
-import io.livekit.android.room.track.LocalAudioTrack
-import io.livekit.android.room.track.RemoteAudioTrack
-import io.livekit.android.room.track.Track
-import io.livekit.android.room.track.TrackPublication
-import io.livekit.android.room.participant.RemoteParticipant
-import io.livekit.android.room.participant.LocalParticipant
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -18,6 +14,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import javax.inject.Inject
+
+private const val TAG = "LiveKitTransport"
 
 class LiveKitTransport @Inject constructor(
     @ApplicationContext private val context: Context
@@ -36,28 +34,39 @@ class LiveKitTransport @Inject constructor(
         if (_state.value != TransportState.DISCONNECTED) return
         
         _state.value = TransportState.CONNECTING
+        Log.d(TAG, "Connecting to LiveKit: url=$signalingUrl")
+        
         scope.launch {
             try {
                 val newRoom = LiveKit.create(context)
                 room = newRoom
                 
+                // Collect events using the correct LiveKit 2.x API
                 scope.launch {
-                    newRoom.events.events.collect { event ->
+                    newRoom.events.collect { event ->
                         when (event) {
                             is RoomEvent.Connected -> {
+                                Log.d(TAG, "Connected to LiveKit room")
                                 _state.value = TransportState.CONNECTED
                                 scope.launch {
-                                    newRoom.localParticipant.setMicrophoneEnabled(true)
+                                    try {
+                                        newRoom.localParticipant.setMicrophoneEnabled(true)
+                                        Log.d(TAG, "Microphone enabled")
+                                    } catch (e: Exception) {
+                                        Log.e(TAG, "Failed to enable mic: ${e.message}")
+                                    }
                                 }
                             }
                             is RoomEvent.FailedToConnect -> {
+                                Log.e(TAG, "Failed to connect to LiveKit")
                                 _state.value = TransportState.DISCONNECTED
                             }
                             is RoomEvent.Disconnected -> {
+                                Log.d(TAG, "Disconnected from LiveKit")
                                 _state.value = TransportState.DISCONNECTED
                             }
                             is RoomEvent.TrackSubscribed -> {
-                                // Subscribed to audio track
+                                Log.d(TAG, "Subscribed to track from ${event.participant.identity?.value}")
                             }
                             is RoomEvent.DataReceived -> {
                                 val senderId = event.participant?.identity?.value ?: "unknown"
@@ -78,6 +87,7 @@ class LiveKitTransport @Inject constructor(
                 newRoom.connect(signalingUrl, connectionToken)
                 
             } catch (e: Exception) {
+                Log.e(TAG, "LiveKit connection error: ${e.message}", e)
                 _state.value = TransportState.DISCONNECTED
             }
         }
@@ -97,10 +107,14 @@ class LiveKitTransport @Inject constructor(
 
     override fun sendDataPacket(packet: DataPacket) {
         scope.launch {
-            room?.localParticipant?.publishData(
-                data = packet.payload,
-                reliability = DataPublishReliability.LOSSY
-            )
+            try {
+                room?.localParticipant?.publishData(
+                    data = packet.payload,
+                    reliability = DataPublishReliability.LOSSY
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to publish data: ${e.message}")
+            }
         }
     }
 
