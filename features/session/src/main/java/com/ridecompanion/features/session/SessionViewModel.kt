@@ -27,7 +27,8 @@ sealed interface SessionUiState {
 class SessionViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val rideApi: RideApi,
-    private val transportManager: AdaptiveTransportManager
+    private val transportManager: AdaptiveTransportManager,
+    private val sessionStore: SessionStore
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow<SessionUiState>(SessionUiState.Idle)
@@ -36,8 +37,17 @@ class SessionViewModel @Inject constructor(
     private val _isServerOnline = MutableStateFlow<Boolean?>(null)
     val isServerOnline: StateFlow<Boolean?> = _isServerOnline
 
+    /** Last-used rider name, to prefill the form. */
+    val savedRiderName: String get() = sessionStore.riderName
+
     init {
         checkServerStatus()
+        // Resume an interrupted ride (app was killed/restarted mid-ride).
+        sessionStore.activeSession()?.let { saved ->
+            transportManager.setLocalRiderName(sessionStore.riderName)
+            startSessionServices(saved.sessionId, saved.token, saved.liveKitUrl)
+            _uiState.value = SessionUiState.Success(saved.sessionId, saved.websocketUrl)
+        }
     }
 
     fun checkServerStatus() {
@@ -54,6 +64,7 @@ class SessionViewModel @Inject constructor(
 
     fun createSession(sessionName: String, riderName: String) {
         _uiState.value = SessionUiState.Loading
+        transportManager.setLocalRiderName(riderName)
         viewModelScope.launch {
             try {
                 val response = rideApi.createSession(
@@ -64,6 +75,7 @@ class SessionViewModel @Inject constructor(
                     token = response.token,
                     url = response.liveKitUrl
                 )
+                persistSession(response, riderName)
                 _uiState.value = SessionUiState.Success(response.sessionId, response.websocketUrl)
             } catch (e: Exception) {
                 _uiState.value = SessionUiState.Error(e.message ?: "Failed to create session")
@@ -73,6 +85,7 @@ class SessionViewModel @Inject constructor(
 
     fun joinSession(sessionId: String, riderName: String) {
         _uiState.value = SessionUiState.Loading
+        transportManager.setLocalRiderName(riderName)
         viewModelScope.launch {
             try {
                 val response = rideApi.joinSession(
@@ -83,11 +96,27 @@ class SessionViewModel @Inject constructor(
                     token = response.token,
                     url = response.liveKitUrl
                 )
+                persistSession(response, riderName)
                 _uiState.value = SessionUiState.Success(response.sessionId, response.websocketUrl)
             } catch (e: Exception) {
                 _uiState.value = SessionUiState.Error(e.message ?: "Failed to join session")
             }
         }
+    }
+
+    private fun persistSession(
+        response: com.ridecompanion.core.network.api.SessionResponse,
+        riderName: String
+    ) {
+        sessionStore.saveActiveSession(
+            SavedSession(
+                sessionId = response.sessionId,
+                token = response.token,
+                liveKitUrl = response.liveKitUrl,
+                websocketUrl = response.websocketUrl
+            ),
+            riderName = riderName
+        )
     }
 
     private fun startSessionServices(sessionId: String, token: String, url: String) {
@@ -102,6 +131,7 @@ class SessionViewModel @Inject constructor(
 
     fun leaveSession() {
         transportManager.stop()
+        sessionStore.clearActiveSession()
         val serviceIntent = Intent(context, RideForegroundService::class.java).apply {
             action = RideForegroundService.ACTION_STOP
         }

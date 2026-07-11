@@ -20,8 +20,17 @@ class AudioVolumeManager @Inject constructor(
     private val _intercomVolumeScale = MutableStateFlow(1.0f)
     val intercomVolumeScale: StateFlow<Float> = _intercomVolumeScale
 
+    // The rider's chosen slider volume. Ducking and focus changes scale
+    // relative to this and restore it afterwards, instead of jumping to 100%.
+    @Volatile private var userVolume = 1.0f
+    @Volatile private var duckFactor = 1.0f
+
     private var audioFocusRequest: AudioFocusRequest? = null
     private var focusChangeListener: AudioManager.OnAudioFocusChangeListener? = null
+
+    private fun applyVolume() {
+        _intercomVolumeScale.value = (userVolume * duckFactor).coerceIn(0f, 1f)
+    }
 
     init {
         setupFocusListener()
@@ -29,20 +38,14 @@ class AudioVolumeManager @Inject constructor(
 
     private fun setupFocusListener() {
         focusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
-            when (focusChange) {
-                AudioManager.AUDIOFOCUS_LOSS -> {
-                    _intercomVolumeScale.value = 0.0f
-                }
-                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                    _intercomVolumeScale.value = 0.2f
-                }
-                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                    _intercomVolumeScale.value = 0.3f
-                }
-                AudioManager.AUDIOFOCUS_GAIN -> {
-                    _intercomVolumeScale.value = 1.0f
-                }
+            duckFactor = when (focusChange) {
+                AudioManager.AUDIOFOCUS_LOSS -> 0.0f
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> 0.2f
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> 0.3f
+                AudioManager.AUDIOFOCUS_GAIN -> 1.0f
+                else -> duckFactor
             }
+            applyVolume()
         }
     }
 
@@ -79,14 +82,25 @@ class AudioVolumeManager @Inject constructor(
             @Suppress("DEPRECATION")
             audioManager.abandonAudioFocus(focusChangeListener)
         }
-        _intercomVolumeScale.value = 1.0f
+        duckFactor = 1.0f
+        applyVolume()
     }
 
+    /** Set the intercom volume directly (0f..1f) — driven by the volume slider. */
+    fun setIntercomVolume(scale: Float) {
+        userVolume = scale.coerceIn(0f, 1f)
+        applyVolume()
+    }
+
+    /** Duck the intercom while a navigation prompt is speaking. */
     fun startDucking() {
-        _intercomVolumeScale.value = 0.3f
+        duckFactor = 0.3f
+        applyVolume()
     }
 
+    /** Restore the rider's chosen volume after the prompt finishes. */
     fun stopDucking() {
-        _intercomVolumeScale.value = 1.0f
+        duckFactor = 1.0f
+        applyVolume()
     }
 }

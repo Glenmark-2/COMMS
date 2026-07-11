@@ -16,15 +16,25 @@ enum class TransportState {
 enum class PacketType {
     AUDIO,
     LOCATION,
+    ROUTE,
     SOS
 }
+
+/** A rider joining or leaving the session, on any transport. */
+data class RiderPresenceEvent(
+    val riderName: String,
+    val joined: Boolean
+)
 
 data class DataPacket(
     val senderId: String,
     val sessionId: String,
     val packetType: PacketType,
     val payload: ByteArray,
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    // True when this packet was relayed from the other transport by a bridging
+    // rider. Forwarded packets must never be forwarded again (loop guard).
+    val forwarded: Boolean = false
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true

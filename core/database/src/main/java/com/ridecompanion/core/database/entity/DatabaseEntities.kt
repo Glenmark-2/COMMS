@@ -30,6 +30,18 @@ data class RideSessionEntity(
     val isActive: Boolean
 )
 
+@Entity(tableName = "ride_summaries")
+data class RideSummaryEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val name: String,
+    val startTime: Long,
+    val endTime: Long,
+    val distanceMeters: Double,
+    val durationMillis: Long,
+    val avgSpeedMps: Float,
+    val maxSpeedMps: Float
+)
+
 @Entity(tableName = "gps_points")
 data class GPSPointEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,

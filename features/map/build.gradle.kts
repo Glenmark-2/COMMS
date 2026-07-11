@@ -42,6 +42,8 @@ dependencies {
     implementation(project(":core:database"))
     implementation(project(":core:location"))
     implementation(project(":core:navigation"))
+    implementation(project(":core:network"))
+    implementation(project(":core:voice"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.ktx)
@@ -55,8 +57,8 @@ dependencies {
     implementation(libs.androidx.compose.material.icons.extended)
     debugImplementation(libs.androidx.compose.ui.tooling)
 
-    // MapLibre
-    implementation(libs.maplibre.android)
+    // osmdroid — canvas-rendered map with built-in offline tile cache
+    implementation(libs.osmdroid.android)
 
     // Hilt
     implementation(libs.hilt.android)

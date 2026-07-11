@@ -18,6 +18,24 @@ const LIVEKIT_URL = process.env.LIVEKIT_URL || 'ws://localhost:7880';
 const sessions = new Map();
 const clients = new Map();
 
+// Sessions outlive the LiveKit token TTL (6h) by a margin, then get pruned so
+// the in-memory maps never grow without bound.
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of sessions) {
+    if (now - session.createdAt > SESSION_TTL_MS) {
+      sessions.delete(id);
+      const ws = clients.get(id);
+      if (ws) {
+        for (const client of ws) client.close(1000, 'Session expired');
+        clients.delete(id);
+      }
+      console.log(`Pruned expired session ${id}`);
+    }
+  }
+}, 30 * 60 * 1000).unref();
+
 async function createLiveKitToken(roomName, participantName, isHost) {
   const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
     identity: participantName,
@@ -55,6 +73,7 @@ app.post('/api/session/create', async (req, res) => {
       leader: riderName,
       destination: null,
       gpxPathJson: null,
+      createdAt: Date.now(),
       riders: [{ name: riderName, isLeader: true }]
     };
 
@@ -91,12 +110,17 @@ app.post('/api/session/join', async (req, res) => {
     return res.status(404).json({ error: 'Session not found' });
   }
 
-  if (session.riders.length >= 3) {
+  // Rejoining under the same name (app restart, network drop) must not add a
+  // duplicate rider or count against the limit.
+  const existing = session.riders.find(r => r.name === riderName);
+  if (!existing && session.riders.length >= 3) {
     return res.status(400).json({ error: 'Session is full (max 3 riders)' });
   }
 
   try {
-    session.riders.push({ name: riderName, isLeader: false });
+    if (!existing) {
+      session.riders.push({ name: riderName, isLeader: false });
+    }
     const token = await createLiveKitToken(session.id, riderName, false);
 
     const protocol = req.get('x-forwarded-proto') === 'https' ? 'wss' : 'ws';

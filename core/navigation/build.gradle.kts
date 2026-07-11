@@ -39,9 +39,6 @@ dependencies {
 
     implementation(libs.androidx.core.ktx)
 
-    // MapLibre Vector Map Engine
-    implementation(libs.maplibre.android)
-
     // Hilt
     implementation(libs.hilt.android)
     kapt(libs.hilt.compiler)

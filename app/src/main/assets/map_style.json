@@ -1,6 +1,6 @@
 {
   "version": 8,
-  "name": "RideCompanion Dark",
+  "name": "RideCompanion Dark Fallback",
   "sources": {
     "carto-dark": {
       "type": "raster",
@@ -9,12 +9,19 @@
         "https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png",
         "https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png"
       ],
-      "tileSize": 256,
-      "attribution": "© OpenStreetMap contributors © CARTO",
+      "tileSize": 512,
+      "attribution": "(c) OpenStreetMap contributors, (c) CARTO",
       "maxzoom": 19
     }
   },
   "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": {
+        "background-color": "#0C0F1D"
+      }
+    },
     {
       "id": "carto-dark-layer",
       "type": "raster",

@@ -1,5 +1,14 @@
 package com.ridecompanion.features.map
 
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color as AColor
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.drawable.BitmapDrawable
+import android.util.Log
+import android.view.MotionEvent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -7,30 +16,56 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MyLocation
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import org.maplibre.android.camera.CameraPosition
-import org.maplibre.android.camera.CameraUpdateFactory
-import org.maplibre.android.geometry.LatLng
-import org.maplibre.android.maps.MapView
-import org.maplibre.android.maps.MapLibreMap
-import org.maplibre.android.maps.Style
-import kotlin.math.roundToInt
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import org.osmdroid.tileprovider.cachemanager.CacheManager
+import org.osmdroid.tileprovider.tilesource.XYTileSource
+import org.osmdroid.util.BoundingBox
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.CustomZoomButtonsController
+import org.osmdroid.views.MapView
+import org.osmdroid.events.MapEventsReceiver
+import org.osmdroid.views.overlay.CopyrightOverlay
+import org.osmdroid.views.overlay.MapEventsOverlay
+import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Overlay
+import org.osmdroid.views.overlay.Polyline
+
+private const val TAG = "MapScreen"
+
+// Navigation camera: street level, course-up, rider in the lower third.
+private const val NAV_ZOOM = 18.0
+private const val FREE_ZOOM = 16.5
+// Above this speed the GPS travel course is the truth; below it the compass
+// takes over, so the map keeps responding while stopped or turning in place.
+private const val GPS_COURSE_MIN_SPEED_MPS = 2.0f
+private const val CAMERA_ANIMATION_MS = 800L
+
+// CARTO dark retina raster tiles (keyless, OSM-based). osmdroid caches every
+// downloaded tile on disk automatically, so anywhere you've ridden — plus the
+// pre-cached route corridor — keeps rendering with no internet.
+private val CARTO_DARK = XYTileSource(
+    "CartoDark2x",
+    1, 19, 512, "@2x.png",
+    arrayOf(
+        "https://a.basemaps.cartocdn.com/dark_all/",
+        "https://b.basemaps.cartocdn.com/dark_all/",
+        "https://c.basemaps.cartocdn.com/dark_all/"
+    ),
+    "© OpenStreetMap contributors © CARTO"
+)
 
 @Composable
 fun MapScreen(
@@ -39,161 +74,265 @@ fun MapScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
 
-    var mapLibreMap by remember { mutableStateOf<MapLibreMap?>(null) }
-    var isMapReady by remember { mutableStateOf(false) }
+    var mapView by remember { mutableStateOf<MapView?>(null) }
+    var rideOverlays by remember { mutableStateOf<RideOverlays?>(null) }
     var hasInitialZoom by remember { mutableStateOf(false) }
+    // Last reliable travel heading — held while stopped so the map doesn't snap north.
+    var lastBearing by remember { mutableStateOf(0f) }
+    // Route signature we already pre-cached, to download each corridor once.
+    var cachedRouteKey by remember { mutableStateOf("") }
 
-    // Update camera when location changes
-    LaunchedEffect(uiState.currentLocation, isMapReady, uiState.isFollowingUser) {
+    val navigating = uiState.routePoints.isNotEmpty()
+
+    // ---- Compass: live heading while slow or stopped ----
+    // GPS course only exists while moving; the rotation-vector compass keeps
+    // the puck and the course-up camera tracking where the rider faces the
+    // moment they turn — the responsiveness real navigation apps have.
+    val compassHeading by viewModel.compassHeading.collectAsState()
+    DisposableEffect(Unit) {
+        viewModel.setCompassActive(true)
+        onDispose { viewModel.setCompassActive(false) }
+    }
+    LaunchedEffect(compassHeading, mapView) {
+        val map = mapView ?: return@LaunchedEffect
+        val ov = rideOverlays ?: return@LaunchedEffect
+        val heading = compassHeading ?: return@LaunchedEffect
+        val speed = uiState.currentLocation?.speed ?: 0f
+        if (speed < GPS_COURSE_MIN_SPEED_MPS) {
+            lastBearing = heading
+            runCatching { ov.puck.bearingDeg = heading }
+            if (uiState.isFollowingUser) {
+                map.mapOrientation = -heading
+            }
+            map.invalidate()
+        }
+    }
+
+    // ---- Camera + rider puck ----
+    LaunchedEffect(uiState.currentLocation, uiState.isFollowingUser, navigating, mapView) {
+        val map = mapView ?: return@LaunchedEffect
+        val ov = rideOverlays ?: return@LaunchedEffect
         val location = uiState.currentLocation ?: return@LaunchedEffect
-        val map = mapLibreMap ?: return@LaunchedEffect
-        if (!isMapReady) return@LaunchedEffect
-        if (!uiState.isFollowingUser && hasInitialZoom) return@LaunchedEffect
 
-        val cameraPosition = CameraPosition.Builder()
-            .target(LatLng(location.latitude, location.longitude))
-            .zoom(if (hasInitialZoom) map.cameraPosition.zoom else 15.0)
-            .bearing(location.bearing.toDouble())
-            .tilt(if (hasInitialZoom) map.cameraPosition.tilt else 45.0)
-            .build()
+        if (location.hasBearing() && location.speed >= GPS_COURSE_MIN_SPEED_MPS) {
+            lastBearing = location.bearing
+        }
 
-        if (!hasInitialZoom) {
-            map.cameraPosition = cameraPosition
-            hasInitialZoom = true
-        } else {
-            map.animateCamera(CameraUpdateFactory.newCameraPosition(cameraPosition), 1000)
+        val here = GeoPoint(location.latitude, location.longitude)
+        runCatching {
+            ov.puck.geo = here
+            ov.puck.bearingDeg = lastBearing
+        }
+
+        if (uiState.isFollowingUser || !hasInitialZoom) {
+            val zoom = if (navigating) NAV_ZOOM else FREE_ZOOM
+            // While navigating, shift the camera focus so the rider sits low on
+            // the screen and the road ahead fills the view — no manual panning.
+            map.setMapCenterOffset(0, if (navigating) (map.height * 0.22).toInt() else 0)
+            if (!hasInitialZoom) {
+                map.controller.setZoom(zoom)
+                map.mapOrientation = -lastBearing
+                map.controller.setCenter(here)
+                hasInitialZoom = true
+            } else {
+                // Course-up: the map rotates so your heading is always "up".
+                map.controller.animateTo(here, zoom, CAMERA_ANIMATION_MS, -lastBearing)
+            }
+        }
+        map.invalidate()
+    }
+
+    // ---- Route line + offline corridor pre-cache ----
+    LaunchedEffect(uiState.routePoints, mapView) {
+        val map = mapView ?: return@LaunchedEffect
+        val ov = rideOverlays ?: return@LaunchedEffect
+        val pts = uiState.routePoints.map { GeoPoint(it.latitude, it.longitude) }
+
+        // Polylines are rebuilt from scratch on every change — osmdroid
+        // overlays can be silently detached (which nulls their internals),
+        // so reusing an old instance is a crash waiting to happen.
+        runCatching {
+            ov.routeCasing?.let { map.overlays.remove(it) }
+            ov.routeLine?.let { map.overlays.remove(it) }
+            ov.routeCasing = null
+            ov.routeLine = null
+            if (pts.size >= 2) {
+                val casing = ov.newRouteCasing(map).also { it.setPoints(pts) }
+                val line = ov.newRouteLine(map).also { it.setPoints(pts) }
+                // Keep the route underneath markers and the puck.
+                map.overlays.add(0, casing)
+                map.overlays.add(1, line)
+                ov.routeCasing = casing
+                ov.routeLine = line
+            }
+            map.invalidate()
+        }.onFailure { Log.e(TAG, "Route overlay update failed: ${it.message}") }
+
+        // Download the tiles along the route once, while we still have signal,
+        // so dead zones on the way are already on disk.
+        if (pts.size >= 2) {
+            val key = "${pts.size}:${pts.first()}:${pts.last()}"
+            if (key != cachedRouteKey) {
+                cachedRouteKey = key
+                preCacheRouteCorridor(map, pts)
+            }
+        }
+    }
+
+    // ---- Destination marker ----
+    LaunchedEffect(uiState.destinationLatitude, uiState.destinationLongitude, mapView) {
+        val map = mapView ?: return@LaunchedEffect
+        val ov = rideOverlays ?: return@LaunchedEffect
+        val lat = uiState.destinationLatitude
+        val lon = uiState.destinationLongitude
+        runCatching {
+            ov.destMarker?.let { map.overlays.remove(it) }
+            ov.destMarker = null
+            if (lat != null && lon != null) {
+                val marker = Marker(map).apply {
+                    position = GeoPoint(lat, lon)
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                    icon = ov.destIcon
+                    setInfoWindow(null)
+                }
+                ov.destMarker = marker
+                map.overlays.add(marker)
+            }
+            map.invalidate()
+        }.onFailure { Log.e(TAG, "Destination overlay update failed: ${it.message}") }
+    }
+
+    // ---- Dropped pin marker ----
+    LaunchedEffect(uiState.droppedPin, mapView) {
+        val map = mapView ?: return@LaunchedEffect
+        val ov = rideOverlays ?: return@LaunchedEffect
+        val pin = uiState.droppedPin
+        runCatching {
+            ov.pinMarker?.let { map.overlays.remove(it) }
+            ov.pinMarker = null
+            if (pin != null) {
+                val marker = Marker(map).apply {
+                    position = GeoPoint(pin.latitude, pin.longitude)
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                    icon = ov.pinIcon
+                    setInfoWindow(null)
+                }
+                ov.pinMarker = marker
+                map.overlays.add(marker)
+            }
+            map.invalidate()
+        }.onFailure { Log.e(TAG, "Pin overlay update failed: ${it.message}") }
+    }
+
+    // ---- Other riders ----
+    LaunchedEffect(uiState.otherRiders, mapView) {
+        val map = mapView ?: return@LaunchedEffect
+        val ov = rideOverlays ?: return@LaunchedEffect
+        runCatching {
+            ov.riderMarkers.forEach { map.overlays.remove(it) }
+            ov.riderMarkers.clear()
+            uiState.otherRiders.forEach { rider ->
+                val marker = Marker(map).apply {
+                    position = GeoPoint(rider.latitude, rider.longitude)
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                    icon = ov.riderIcon
+                    setInfoWindow(null)
+                }
+                ov.riderMarkers.add(marker)
+                map.overlays.add(marker)
+            }
+            map.invalidate()
+        }.onFailure { Log.e(TAG, "Rider overlay update failed: ${it.message}") }
+    }
+
+    // ---- Route preview: fit the whole route once when a destination is set ----
+    LaunchedEffect(uiState.destinationLatitude, uiState.destinationLongitude, mapView) {
+        val map = mapView ?: return@LaunchedEffect
+        val dLat = uiState.destinationLatitude ?: return@LaunchedEffect
+        val dLon = uiState.destinationLongitude ?: return@LaunchedEffect
+        val loc = uiState.currentLocation ?: return@LaunchedEffect
+        // Un-follow to show the whole route; following resumes automatically
+        // once the rider starts moving.
+        viewModel.onRoutePreviewShown()
+        map.setMapCenterOffset(0, 0)
+        map.mapOrientation = 0f
+        val box = BoundingBox.fromGeoPoints(
+            listOf(GeoPoint(loc.latitude, loc.longitude), GeoPoint(dLat, dLon))
+        )
+        runCatching { map.zoomToBoundingBox(box.increaseByScale(1.4f), true, 80) }
+    }
+
+    // osmdroid MapView lifecycle: resume/pause its tile loading with the screen.
+    // Keyed on the lifecycle owner ONLY — keying on mapView would restart the
+    // effect when the view is created, and the restart's dispose would call
+    // onDetach() on the brand-new map, killing its tile loader and overlays.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> mapView?.onResume()
+                Lifecycle.Event.ON_PAUSE -> mapView?.onPause()
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            mapView?.onDetach()
         }
     }
 
     Box(modifier = modifier.fillMaxSize()) {
-        // Map
         AndroidView(
             factory = { ctx ->
                 MapView(ctx).apply {
-                    onCreate(null)
-                    getMapAsync { map ->
-                        mapLibreMap = map
+                    // Compose detaches/reattaches views during transitions; stop
+                    // osmdroid from destroying its overlays when that happens.
+                    // Real teardown runs in our DisposableEffect via onDetach().
+                    setDestroyMode(false)
+                    setTileSource(CARTO_DARK)
+                    setMultiTouchControls(true)
+                    zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
+                    // 512px retina tiles already carry the 2x detail.
+                    isTilesScaledToDpi = false
+                    minZoomLevel = 4.0
+                    maxZoomLevel = 19.5
+                    controller.setZoom(FREE_ZOOM)
 
-                        // Load dark style from assets
-                        val styleJson = ctx.assets.open("map_style.json")
-                            .bufferedReader().use { it.readText() }
-
-                        map.setStyle(Style.Builder().fromJson(styleJson)) { style ->
-                            isMapReady = true
-
-                            // Enable location component (blue dot)
-                            try {
-                                map.locationComponent.apply {
-                                    activateLocationComponent(
-                                        org.maplibre.android.location.LocationComponentActivationOptions
-                                            .builder(ctx, style)
-                                            .useDefaultLocationEngine(true)
-                                            .build()
-                                    )
-                                    isLocationComponentEnabled = true
-                                    cameraMode = org.maplibre.android.location.modes.CameraMode.NONE
-                                    renderMode = org.maplibre.android.location.modes.RenderMode.COMPASS
-                                }
-                            } catch (e: SecurityException) {
-                                // Location permission not yet granted — that's okay,
-                                // the dot won't show until permission is granted
-                            }
+                    val ov = RideOverlays(ctx, this)
+                    // Long-press anywhere to drop a pin and ride to it.
+                    overlays.add(MapEventsOverlay(object : MapEventsReceiver {
+                        override fun singleTapConfirmedHelper(p: GeoPoint?) = false
+                        override fun longPressHelper(p: GeoPoint?): Boolean {
+                            p ?: return false
+                            viewModel.dropPin(p.latitude, p.longitude)
+                            return true
                         }
+                    }))
+                    overlays.add(ov.puck)
+                    overlays.add(CopyrightOverlay(ctx).apply {
+                        setTextColor(AColor.parseColor("#8A93A8"))
+                        setAlignBottom(true)
+                        setOffset(12, 220)
+                    })
 
-                        // Detect user panning
-                        map.addOnCameraMoveStartedListener { reason ->
-                            if (reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE) {
-                                viewModel.setFollowingUser(false)
-                            }
+                    // Any drag/pinch means the rider wants to look around —
+                    // stop auto-following until they tap recenter.
+                    setOnTouchListener { v, event ->
+                        if (event.actionMasked == MotionEvent.ACTION_MOVE) {
+                            viewModel.setFollowingUser(false)
                         }
-
-                        // Map UI settings
-                        map.uiSettings.isCompassEnabled = false
-                        map.uiSettings.isRotateGesturesEnabled = true
-                        map.uiSettings.isTiltGesturesEnabled = true
+                        if (event.actionMasked == MotionEvent.ACTION_UP) v.performClick()
+                        false
                     }
+
+                    rideOverlays = ov
+                    mapView = this
                 }
             },
             modifier = Modifier.fillMaxSize(),
             update = { _ -> }
         )
-
-        // Speed indicator (top-left)
-        Box(
-            modifier = Modifier
-                .padding(start = 16.dp, top = 60.dp)
-                .align(Alignment.TopStart)
-                .clip(RoundedCornerShape(16.dp))
-                .background(Color(0xE60C0D14))
-                .border(1.dp, Color(0x33ffffff), RoundedCornerShape(16.dp))
-                .padding(horizontal = 20.dp, vertical = 12.dp)
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                val speedKmh = uiState.currentLocation?.speed?.let { (it * 3.6f).roundToInt() } ?: 0
-                Text(
-                    text = "$speedKmh",
-                    fontSize = 42.sp,
-                    fontWeight = FontWeight.Black,
-                    color = Color(0xFF00E5FF)
-                )
-                Text(
-                    text = "km/h",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color(0xFF8A90A6)
-                )
-            }
-        }
-
-        // Other riders panel (top-right)
-        if (uiState.otherRiders.isNotEmpty()) {
-            Column(
-                modifier = Modifier
-                    .padding(end = 16.dp, top = 60.dp)
-                    .align(Alignment.TopEnd)
-                    .width(140.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                uiState.otherRiders.forEach { rider ->
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(Color(0xCC0C0D14))
-                            .border(1.dp, Color(0x1Fffffff), RoundedCornerShape(12.dp))
-                            .padding(8.dp)
-                    ) {
-                        Column {
-                            Text(
-                                text = rider.userId.take(8),
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Row(
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text(
-                                    text = "${rider.batteryPercentage}% 🔋",
-                                    fontSize = 10.sp,
-                                    color = Color(0xFF8A90A6)
-                                )
-                                val signalColor = if (rider.networkType.name == "OFFLINE") Color(0xFFFF5252) else Color(0xFF00E676)
-                                Box(
-                                    modifier = Modifier
-                                        .size(6.dp)
-                                        .clip(CircleShape)
-                                        .background(signalColor)
-                                        .align(Alignment.CenterVertically)
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         // Recenter button
         AnimatedVisibility(
@@ -202,68 +341,171 @@ fun MapScreen(
             exit = fadeOut(),
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(end = 16.dp, bottom = 160.dp)
+                .navigationBarsPadding()
+                .padding(end = 16.dp, bottom = 96.dp)
         ) {
             IconButton(
                 onClick = { viewModel.setFollowingUser(true) },
                 modifier = Modifier
-                    .size(48.dp)
+                    .size(52.dp)
                     .clip(CircleShape)
-                    .background(Color(0xE600E5FF))
+                    .background(Color(0xF20C0F1D))
+                    .border(1.dp, Color(0x3300E5FF), CircleShape)
             ) {
                 Icon(
                     imageVector = Icons.Default.MyLocation,
-                    contentDescription = "Recenter",
-                    tint = Color(0xFF060913),
+                    contentDescription = "Recenter on my location",
+                    tint = Color(0xFF00E5FF),
                     modifier = Modifier.size(24.dp)
                 )
             }
         }
+    }
+}
 
-        // Off-route warning
-        AnimatedVisibility(
-            visible = uiState.isOffRoute && uiState.snapResult != null,
-            enter = fadeIn(),
-            exit = fadeOut(),
-            modifier = Modifier
-                .padding(24.dp)
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 150.dp)
-        ) {
-            val snap = uiState.snapResult ?: return@AnimatedVisibility
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(Color(0xFFE65100))
-                    .border(1.dp, Color(0x7Fffffff), RoundedCornerShape(20.dp))
-                    .padding(horizontal = 24.dp, vertical = 14.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = Icons.Default.PlayArrow,
-                    contentDescription = "Rejoin Arrow",
-                    tint = Color.White,
-                    modifier = Modifier
-                        .size(28.dp)
-                        .rotate(snap.bearingToRejoinDegrees - 90f)
-                )
-                Spacer(modifier = Modifier.width(16.dp))
-                Column {
-                    Text(
-                        text = "OFF ROUTE",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xCCffffff),
-                        letterSpacing = 1.sp
-                    )
-                    Text(
-                        text = "Rejoin in ${snap.distanceToRouteMeters.roundToInt()}m",
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Black,
-                        color = Color.White
-                    )
-                }
-            }
+/** All the overlays we draw on top of the base map. */
+private class RideOverlays(ctx: Context, map: MapView) {
+    private val density = ctx.resources.displayMetrics.density
+
+    // Route polylines are created fresh for every route change.
+    var routeCasing: Polyline? = null
+    var routeLine: Polyline? = null
+
+    fun newRouteCasing(map: MapView) = Polyline(map).apply {
+        setInfoWindow(null)
+        outlinePaint.apply {
+            color = AColor.parseColor("#003A44")
+            strokeWidth = 9f * density
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            isAntiAlias = true
         }
+    }
+
+    fun newRouteLine(map: MapView) = Polyline(map).apply {
+        setInfoWindow(null)
+        outlinePaint.apply {
+            color = AColor.parseColor("#00E5FF")
+            strokeWidth = 5f * density
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            isAntiAlias = true
+        }
+    }
+
+    val puck = PuckOverlay(buildPuckBitmap(density))
+
+    val riderIcon = BitmapDrawable(
+        ctx.resources,
+        buildDotBitmap(density, fill = AColor.parseColor("#FFAB40"), ring = AColor.parseColor("#0C0F1D"))
+    )
+    val destIcon = BitmapDrawable(
+        ctx.resources,
+        buildDotBitmap(density, fill = AColor.parseColor("#FF5252"), ring = AColor.WHITE)
+    )
+    val pinIcon = BitmapDrawable(
+        ctx.resources,
+        buildDotBitmap(density, fill = AColor.parseColor("#00E5FF"), ring = AColor.WHITE)
+    )
+
+    var destMarker: Marker? = null
+    var pinMarker: Marker? = null
+    val riderMarkers = mutableListOf<Marker>()
+}
+
+/**
+ * The rider's own marker. Drawn by hand so the rotation math is explicit:
+ * the overlay canvas is already rotated by the map orientation, so rotating
+ * the bitmap by the travel bearing makes the arrow point at the true heading —
+ * straight up while the camera is course-up, and at the correct map angle when
+ * the rider pans around.
+ */
+private class PuckOverlay(private val bitmap: Bitmap) : Overlay() {
+    @Volatile var geo: GeoPoint? = null
+    @Volatile var bearingDeg: Float = 0f
+
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val screenPoint = android.graphics.Point()
+
+    override fun draw(canvas: Canvas, mapView: MapView, shadow: Boolean) {
+        if (shadow) return
+        val g = geo ?: return
+        mapView.projection.toPixels(g, screenPoint)
+        val x = screenPoint.x.toFloat()
+        val y = screenPoint.y.toFloat()
+        canvas.save()
+        canvas.rotate(bearingDeg, x, y)
+        canvas.drawBitmap(bitmap, x - bitmap.width / 2f, y - bitmap.height / 2f, paint)
+        canvas.restore()
+    }
+}
+
+/** Brand-cyan navigation puck: dark ring, cyan disc, white heading arrow (points north). */
+private fun buildPuckBitmap(density: Float): Bitmap {
+    val size = (46 * density).toInt()
+    val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    val c = Canvas(bmp)
+    val cx = size / 2f
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    paint.color = AColor.parseColor("#0C0F1D")
+    c.drawCircle(cx, cx, cx * 0.98f, paint)
+    paint.color = AColor.parseColor("#00E5FF")
+    c.drawCircle(cx, cx, cx * 0.80f, paint)
+
+    paint.color = AColor.WHITE
+    val arrow = Path().apply {
+        moveTo(cx, cx * 0.32f)              // tip (north)
+        lineTo(cx * 0.62f, cx * 1.30f)      // bottom left
+        lineTo(cx, cx * 1.05f)              // notch
+        lineTo(cx * 1.38f, cx * 1.30f)      // bottom right
+        close()
+    }
+    c.drawPath(arrow, paint)
+    return bmp
+}
+
+/** Small round marker used for other riders and the destination. */
+private fun buildDotBitmap(density: Float, fill: Int, ring: Int): Bitmap {
+    val size = (22 * density).toInt()
+    val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    val c = Canvas(bmp)
+    val cx = size / 2f
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    paint.color = ring
+    c.drawCircle(cx, cx, cx * 0.95f, paint)
+    paint.color = fill
+    c.drawCircle(cx, cx, cx * 0.70f, paint)
+    return bmp
+}
+
+/**
+ * Download the map tiles covering the route (zooms 12–16) while we still have
+ * internet, so the navigation map keeps working through dead zones. Runs
+ * silently in the background; failures are non-fatal (tiles just load live).
+ */
+private fun preCacheRouteCorridor(map: MapView, points: List<GeoPoint>) {
+    runCatching {
+        val box = BoundingBox.fromGeoPoints(points)
+        val padded = BoundingBox(
+            box.latNorth + 0.01, box.lonEast + 0.01,
+            box.latSouth - 0.01, box.lonWest - 0.01
+        )
+        CacheManager(map).downloadAreaAsyncNoUI(
+            map.context, padded, 12, 16,
+            object : CacheManager.CacheManagerCallback {
+                override fun onTaskComplete() {
+                    Log.d(TAG, "Route corridor cached for offline use")
+                }
+                override fun onTaskFailed(errors: Int) {
+                    Log.w(TAG, "Corridor caching finished with $errors errors")
+                }
+                override fun updateProgress(progress: Int, currentZoomLevel: Int, zoomMin: Int, zoomMax: Int) {}
+                override fun downloadStarted() {}
+                override fun setPossibleTilesInArea(total: Int) {}
+            }
+        )
+    }.onFailure {
+        Log.w(TAG, "Corridor caching unavailable: ${it.message}")
     }
 }

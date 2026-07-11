@@ -7,6 +7,7 @@ import androidx.room.Query
 import com.ridecompanion.core.database.entity.GPSPointEntity
 import com.ridecompanion.core.database.entity.RideSessionEntity
 import com.ridecompanion.core.database.entity.RiderStateEntity
+import com.ridecompanion.core.database.entity.RideSummaryEntity
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -53,4 +54,14 @@ interface RideDao {
 
     @Query("UPDATE gps_points SET isSynced = 1 WHERE id IN (:pointIds)")
     suspend fun markPointsAsSynced(pointIds: List<Long>)
+
+    // Ride history / summaries
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRideSummary(summary: RideSummaryEntity)
+
+    @Query("SELECT * FROM ride_summaries ORDER BY endTime DESC")
+    fun getAllRideSummaries(): Flow<List<RideSummaryEntity>>
+
+    @Query("DELETE FROM ride_summaries")
+    suspend fun clearRideSummaries()
 }
