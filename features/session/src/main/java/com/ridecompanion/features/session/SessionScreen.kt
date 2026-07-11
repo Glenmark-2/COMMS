@@ -14,6 +14,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.DirectionsBike
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
@@ -59,6 +60,8 @@ fun SessionScreen(
     var sessionName by remember { mutableStateOf("") }
     var sessionIdToJoin by remember { mutableStateOf("") }
     var isCreateMode by remember { mutableStateOf(true) }
+    // Ask for the name only the first time — after that it's a one-tap chip.
+    var editingName by remember { mutableStateOf(viewModel.savedRiderName.isBlank()) }
 
     LaunchedEffect(uiState) {
         if (uiState is SessionUiState.Success) {
@@ -147,12 +150,36 @@ fun SessionScreen(
 
                 Spacer(Modifier.height(16.dp))
 
-                RideTextField(
-                    value = riderName,
-                    onValueChange = { riderName = it.take(20) },
-                    label = "Your name",
-                    capitalization = KeyboardCapitalization.Words
-                )
+                if (editingName) {
+                    RideTextField(
+                        value = riderName,
+                        onValueChange = { riderName = it.take(20) },
+                        label = "Your name",
+                        capitalization = KeyboardCapitalization.Words
+                    )
+                } else {
+                    // Name is remembered — show it, don't ask again.
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(SurfaceHigh)
+                            .clickable { editingName = true }
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("RIDING AS", color = TextTertiary, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
+                            Text(riderName, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        }
+                        Icon(
+                            Icons.Default.Edit,
+                            contentDescription = "Change name",
+                            tint = TextSecondary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
 
                 Spacer(Modifier.height(12.dp))
 

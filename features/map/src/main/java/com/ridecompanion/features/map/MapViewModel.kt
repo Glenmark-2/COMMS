@@ -582,7 +582,10 @@ class MapViewModel @Inject constructor(
                 routeAscentMeters = path.ascentMeters,
                 routeProfile = path.profile,
                 isRoutingInProgress = false,
-                routeError = null
+                routeError = null,
+                // The old route's snap must not linger on the new geometry.
+                snapResult = null,
+                isOffRoute = false
             )
         }
     }
@@ -710,7 +713,9 @@ class MapViewModel @Inject constructor(
                     routeDurationSeconds = json.optDouble("time", 0.0),
                     routeAscentMeters = json.optDouble("asc", 0.0),
                     routeProfile = profile,
-                    routeError = null
+                    routeError = null,
+                    snapResult = null,
+                    isOffRoute = false
                 )
             }
         } catch (e: Exception) {

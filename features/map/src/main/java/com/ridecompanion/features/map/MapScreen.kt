@@ -42,6 +42,7 @@ import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Overlay
 import org.osmdroid.views.overlay.Polyline
+import org.osmdroid.views.overlay.gestures.RotationGestureOverlay
 
 private const val TAG = "MapScreen"
 
@@ -179,6 +180,28 @@ fun MapScreen(
         }
     }
 
+    // ---- Progress: the route line recedes as the rider travels it ----
+    // Only the remaining stretch is drawn — from the rider's snapped position
+    // to the destination — so the blue line visibly shrinks behind you.
+    LaunchedEffect(uiState.snapResult, uiState.routePoints, mapView) {
+        val map = mapView ?: return@LaunchedEffect
+        val ov = rideOverlays ?: return@LaunchedEffect
+        val snap = uiState.snapResult ?: return@LaunchedEffect
+        val route = uiState.routePoints
+        if (route.size < 2 || ov.routeLine == null) return@LaunchedEffect
+        val segIndex = snap.routeSegmentIndex.coerceIn(0, route.size - 2)
+        val remaining = ArrayList<GeoPoint>(route.size - segIndex)
+        remaining.add(GeoPoint(snap.closestPoint.latitude, snap.closestPoint.longitude))
+        for (i in segIndex + 1 until route.size) {
+            remaining.add(GeoPoint(route[i].latitude, route[i].longitude))
+        }
+        runCatching {
+            ov.routeCasing?.setPoints(remaining)
+            ov.routeLine?.setPoints(remaining)
+            map.invalidate()
+        }.onFailure { Log.e(TAG, "Route trim failed: ${it.message}") }
+    }
+
     // ---- Destination marker ----
     LaunchedEffect(uiState.destinationLatitude, uiState.destinationLongitude, mapView) {
         val map = mapView ?: return@LaunchedEffect
@@ -300,6 +323,9 @@ fun MapScreen(
                     controller.setZoom(FREE_ZOOM)
 
                     val ov = RideOverlays(ctx, this)
+                    // Two-finger twist rotates the map freely while browsing;
+                    // recentering snaps back to course-up.
+                    overlays.add(RotationGestureOverlay(this).apply { isEnabled = true })
                     // Long-press anywhere to drop a pin and ride to it.
                     overlays.add(MapEventsOverlay(object : MapEventsReceiver {
                         override fun singleTapConfirmedHelper(p: GeoPoint?) = false
