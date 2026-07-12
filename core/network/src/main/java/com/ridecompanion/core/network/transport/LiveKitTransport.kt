@@ -48,6 +48,23 @@ class LiveKitTransport @Inject constructor(
     private var payloadListener: PayloadListener? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    // The coroutine collecting the current room's events. Must die with the
+    // room — otherwise every reconnect leaks a collector plus the room's
+    // native WebRTC resources, and the app gets slower with every ride.
+    private var eventsJob: Job? = null
+
+    /** Fully dispose a room: stop listening, disconnect, free native resources. */
+    private fun discardRoom(oldRoom: Room?) {
+        eventsJob?.cancel()
+        eventsJob = null
+        if (oldRoom != null) {
+            scope.launch {
+                runCatching { oldRoom.disconnect() }
+                runCatching { oldRoom.release() }
+            }
+        }
+    }
+
     // Remote audio tracks we control the playback volume of (slider + nav ducking).
     private val remoteAudioTracks = mutableSetOf<RemoteAudioTrack>()
     private var currentVolume = 1.0
@@ -79,7 +96,7 @@ class LiveKitTransport @Inject constructor(
                 // Tear down any half-dead room from a previous attempt first.
                 room?.let { old ->
                     room = null
-                    runCatching { old.disconnect() }
+                    discardRoom(old)
                 }
                 _state.value = TransportState.CONNECTING
                 Log.d(TAG, "Connecting to LiveKit (attempt $attempt): url=$url")
@@ -102,7 +119,7 @@ class LiveKitTransport @Inject constructor(
         val newRoom = LiveKit.create(context)
         room = newRoom
 
-        scope.launch {
+        eventsJob = scope.launch {
             newRoom.events.collect { event ->
                 when (event) {
                     is RoomEvent.Connected -> {
@@ -198,9 +215,7 @@ class LiveKitTransport @Inject constructor(
         room = null
         synchronized(remoteAudioTracks) { remoteAudioTracks.clear() }
         _activeSpeakers.value = emptyList()
-        scope.launch {
-            runCatching { oldRoom?.disconnect() }
-        }
+        discardRoom(oldRoom)
     }
 
     /** Enable or disable the local microphone (intercom mute/unmute). */

@@ -66,6 +66,7 @@ class RideForegroundService : Service() {
     private var currentInterval = 10000L
     private var currentSessionId: String? = null
     private var telemetryJob: Job? = null
+    private var navIntervalJob: Job? = null
     @Volatile private var lastLocation: Location? = null
 
     companion object {
@@ -98,29 +99,40 @@ class RideForegroundService : Service() {
                 }
             }
         }
-        return START_STICKY
+        // NOT_STICKY: if the system kills us, don't zombie-restart with a null
+        // intent and no session — the app re-asserts the service when the
+        // dashboard is next visible.
+        return START_NOT_STICKY
     }
 
+    @Volatile private var isRunning = false
+
     private fun startRideService(sessionId: String) {
-        currentSessionId = sessionId
-        lastGoodLocation = null
+        // Every ACTION_START must promptly (re)assert foreground state.
         val notification = buildNotification("Ride Active", "Tracking location and voice intercom...")
-        
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
-                NOTIFICATION_ID, 
-                notification, 
+                NOTIFICATION_ID,
+                notification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
-        
+
+        // Idempotent: the dashboard re-asserts the service on every visit, and
+        // a full re-init here would leak jobs, callbacks and detectors.
+        if (isRunning && currentSessionId == sessionId) return
+        if (isRunning) stopSessionWork() // switching sessions — clean re-init
+        isRunning = true
+
+        currentSessionId = sessionId
+        lastGoodLocation = null
         requestLocationUpdates(currentInterval)
 
         // React immediately when navigation starts/stops — don't wait for the
         // next (possibly 15 s away) fix to tighten the GPS interval.
-        serviceScope.launch {
+        navIntervalJob = serviceScope.launch {
             navigationStatusHolder.isNavigating.collect { navigating ->
                 val wanted = BatteryOptimizer.getOptimalInterval(
                     lastLocation?.speed ?: 0f, navigating
@@ -193,14 +205,24 @@ class RideForegroundService : Service() {
         }
     }
 
-    private fun stopRideService() {
+    /** Stop everything tied to the current session, keeping the service alive. */
+    private fun stopSessionWork() {
         locationCallback?.let {
             fusedLocationClient.removeLocationUpdates(it)
         }
+        locationCallback = null
         telemetryJob?.cancel()
         telemetryJob = null
+        navIntervalJob?.cancel()
+        navIntervalJob = null
         crashDetector?.stop()
         crashDetector = null
+        isRunning = false
+        currentSessionId = null
+    }
+
+    private fun stopRideService() {
+        stopSessionWork()
         releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -457,6 +479,10 @@ class RideForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        // System kill or normal stop — never leave GPS callbacks, sensors or
+        // the wake lock behind.
+        stopSessionWork()
+        releaseWakeLock()
         serviceScope.cancel()
         super.onDestroy()
     }

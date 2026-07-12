@@ -98,6 +98,9 @@ fun MapScreen(
     var lastBearing by remember { mutableStateOf(0f) }
     // Route signature we already pre-cached, to download each corridor once.
     var cachedRouteKey by remember { mutableStateOf("") }
+    // In-flight offline-tile download, so a new route (or leaving the screen)
+    // cancels it instead of stacking downloads that starve the network.
+    var cacheTask by remember { mutableStateOf<CacheManager.CacheManagerTask?>(null) }
 
     val navigating = uiState.routePoints.isNotEmpty()
 
@@ -196,7 +199,8 @@ fun MapScreen(
             val key = "${pts.size}:${pts.first()}:${pts.last()}"
             if (key != cachedRouteKey) {
                 cachedRouteKey = key
-                preCacheRouteCorridor(map, pts)
+                runCatching { cacheTask?.cancel(true) }
+                cacheTask = preCacheRouteCorridor(map, pts)
             }
         }
     }
@@ -335,6 +339,7 @@ fun MapScreen(
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
+            runCatching { cacheTask?.cancel(true) }
             mapView?.onDetach()
         }
     }
@@ -593,19 +598,27 @@ private fun buildDotBitmap(density: Float, fill: Int, ring: Int): Bitmap {
 }
 
 /**
- * Download the map tiles covering the route (zooms 12–16) while we still have
+ * Download the map tiles covering the route (zooms 12–15) while we still have
  * internet, so the navigation map keeps working through dead zones. Runs
  * silently in the background; failures are non-fatal (tiles just load live).
+ * Very long routes are skipped — a huge bounding box means tens of thousands
+ * of tile downloads, which starves the network and makes the whole app lag.
  */
-private fun preCacheRouteCorridor(map: MapView, points: List<GeoPoint>) {
-    runCatching {
+private fun preCacheRouteCorridor(map: MapView, points: List<GeoPoint>): CacheManager.CacheManagerTask? {
+    return try {
         val box = BoundingBox.fromGeoPoints(points)
+        val latSpan = box.latNorth - box.latSouth
+        val lonSpan = kotlin.math.abs(box.lonEast - box.lonWest)
+        if (latSpan > 0.5 || lonSpan > 0.5) {
+            Log.d(TAG, "Route too large to pre-cache — tiles will load live")
+            return null
+        }
         val padded = BoundingBox(
             box.latNorth + 0.01, box.lonEast + 0.01,
             box.latSouth - 0.01, box.lonWest - 0.01
         )
         CacheManager(map).downloadAreaAsyncNoUI(
-            map.context, padded, 12, 16,
+            map.context, padded, 12, 15,
             object : CacheManager.CacheManagerCallback {
                 override fun onTaskComplete() {
                     Log.d(TAG, "Route corridor cached for offline use")
@@ -618,7 +631,8 @@ private fun preCacheRouteCorridor(map: MapView, points: List<GeoPoint>) {
                 override fun setPossibleTilesInArea(total: Int) {}
             }
         )
-    }.onFailure {
-        Log.w(TAG, "Corridor caching unavailable: ${it.message}")
+    } catch (e: Exception) {
+        Log.w(TAG, "Corridor caching unavailable: ${e.message}")
+        null
     }
 }

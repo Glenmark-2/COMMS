@@ -48,6 +48,17 @@ class AdaptiveTransportManager @Inject constructor(
     private val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    // Stable random id for THIS installation. Loop/echo detection must not use
+    // the display name — two riders who both type "Alex" would silently drop
+    // each other's locations and SOS alerts.
+    private val deviceId: String = context
+        .getSharedPreferences("transport_ids", Context.MODE_PRIVATE)
+        .let { prefs ->
+            prefs.getString("device_id", null) ?: java.util.UUID.randomUUID().toString()
+                .take(8)
+                .also { prefs.edit().putString("device_id", it).apply() }
+        }
+
     /** Riders currently speaking, on either transport (cloud events + P2P VAD). */
     val activeSpeakers: StateFlow<List<String>> =
         combine(liveKitTransport.activeSpeakers, nearbyTransport.activeSpeakers) { cloud, p2p ->
@@ -201,21 +212,46 @@ class AdaptiveTransportManager @Inject constructor(
      * sync (one rider offline in a dead zone still hears about routes and SOS).
      */
     fun sendData(packet: DataPacket) {
+        val stamped = stampOrigin(packet)
         scope.launch {
             if (liveKitTransport.state.value == TransportState.CONNECTED) {
-                liveKitTransport.sendDataPacket(packet)
+                liveKitTransport.sendDataPacket(stamped)
             }
             if (nearbyTransport.state.value == TransportState.CONNECTED) {
-                nearbyTransport.sendDataPacket(packet)
+                nearbyTransport.sendDataPacket(stamped)
             }
         }
     }
 
+    /** Tag outgoing JSON payloads with this installation's id for echo detection. */
+    private fun stampOrigin(packet: DataPacket): DataPacket {
+        return try {
+            val json = org.json.JSONObject(String(packet.payload, Charsets.UTF_8))
+            if (!json.has("origin")) json.put("origin", deviceId)
+            packet.copy(payload = json.toString().toByteArray(Charsets.UTF_8))
+        } catch (e: Exception) {
+            packet
+        }
+    }
+
+    private fun originOf(packet: DataPacket): String? = try {
+        org.json.JSONObject(String(packet.payload, Charsets.UTF_8))
+            .optString("origin").ifBlank { null }
+    } catch (e: Exception) {
+        null
+    }
+
     private fun handleIncoming(packet: DataPacket, from: TransportType) {
-        // A bridged copy of our own packet can come back around — drop it.
-        // The original sender's name travels inside the payload ("sender").
+        // A bridged copy of our own packet can come back around — drop it by
+        // installation id (names may collide between riders); fall back to the
+        // name check only for packets from older app versions.
         val originalSender = senderOf(packet)
-        if (originalSender == localRiderName) return
+        val origin = originOf(packet)
+        if (origin != null) {
+            if (origin == deviceId) return
+        } else if (originalSender == localRiderName) {
+            return
+        }
 
         scope.launch {
             _incomingPackets.emit(packet.copy(senderId = originalSender))

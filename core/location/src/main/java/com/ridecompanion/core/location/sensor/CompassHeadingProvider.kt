@@ -40,6 +40,7 @@ class CompassHeadingProvider @Inject constructor(
     private val rotationMatrix = FloatArray(9)
     private val orientation = FloatArray(3)
     private var smoothed = Float.NaN
+    private var lastPublishMillis = 0L
 
     fun start() {
         val sensor = rotationSensor ?: return
@@ -86,9 +87,15 @@ class CompassHeadingProvider @Inject constructor(
             (smoothed + alpha * delta + 360f) % 360f
         }
 
-        // Only publish meaningful changes so collectors aren't spammed at 50 Hz.
+        // Publish at most ~10 Hz and only on real change: every published
+        // heading triggers a full map redraw, and 50 redraws/second is what
+        // makes a phone with a long route polyline stutter.
+        val now = android.os.SystemClock.elapsedRealtime()
         val current = _headingDegrees.value
-        if (current == null || angleDelta(current, smoothed) > 1.0f) {
+        if ((current == null || angleDelta(current, smoothed) > 1.0f) &&
+            now - lastPublishMillis >= 100L
+        ) {
+            lastPublishMillis = now
             _headingDegrees.value = smoothed
         }
     }

@@ -125,6 +125,12 @@ fun RideDashboardScreen(
         onDispose { view.keepScreenOn = false }
     }
 
+    // (Re)assert the ride foreground service now that the app is visibly in
+    // the foreground — cold-start session resume defers the start to here.
+    LaunchedEffect(Unit) {
+        sessionViewModel.ensureServiceRunning()
+    }
+
     // 1-second ticker for elapsed ride time.
     var nowMillis by remember { mutableStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {

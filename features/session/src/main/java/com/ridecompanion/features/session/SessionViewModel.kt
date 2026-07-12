@@ -43,11 +43,29 @@ class SessionViewModel @Inject constructor(
     init {
         checkServerStatus()
         // Resume an interrupted ride (app was killed/restarted mid-ride).
+        // Only restore state + transports here — the foreground service is
+        // started by the dashboard once it's visible. Starting a microphone/
+        // location service during cold start can be rejected by Android 14+
+        // and wedge the whole launch.
         sessionStore.activeSession()?.let { saved ->
             transportManager.setLocalRiderName(sessionStore.riderName)
-            startSessionServices(saved.sessionId, saved.token, saved.liveKitUrl)
+            runCatching { transportManager.start(saved.sessionId, saved.token, saved.liveKitUrl) }
             _uiState.value = SessionUiState.Success(saved.sessionId, saved.websocketUrl)
         }
+    }
+
+    /**
+     * Start (or re-assert) the ride foreground service. Idempotent; called by
+     * the ride dashboard when it becomes visible, when the app is safely in
+     * the foreground.
+     */
+    fun ensureServiceRunning() {
+        val sessionId = (_uiState.value as? SessionUiState.Success)?.sessionId ?: return
+        val serviceIntent = Intent(context, RideForegroundService::class.java).apply {
+            action = RideForegroundService.ACTION_START
+            putExtra(RideForegroundService.EXTRA_SESSION_ID, sessionId)
+        }
+        runCatching { context.startForegroundService(serviceIntent) }
     }
 
     fun checkServerStatus() {
@@ -120,13 +138,15 @@ class SessionViewModel @Inject constructor(
     }
 
     private fun startSessionServices(sessionId: String, token: String, url: String) {
-        transportManager.start(sessionId, token, url)
+        runCatching { transportManager.start(sessionId, token, url) }
 
         val serviceIntent = Intent(context, RideForegroundService::class.java).apply {
             action = RideForegroundService.ACTION_START
             putExtra(RideForegroundService.EXTRA_SESSION_ID, sessionId)
         }
-        context.startForegroundService(serviceIntent)
+        // A rejected start (rare OEM background quirks) must never crash the
+        // app — the dashboard re-asserts the service when it becomes visible.
+        runCatching { context.startForegroundService(serviceIntent) }
     }
 
     fun leaveSession() {
