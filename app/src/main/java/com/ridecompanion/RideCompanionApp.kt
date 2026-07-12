@@ -14,8 +14,11 @@ class RideCompanionApp : Application() {
         Configuration.getInstance().apply {
             load(this@RideCompanionApp, getSharedPreferences("osmdroid", MODE_PRIVATE))
             userAgentValue = packageName
-            tileFileSystemCacheMaxBytes = 600L * 1024 * 1024
-            tileFileSystemCacheTrimBytes = 500L * 1024 * 1024
+            // Generous enough for several ride corridors, small enough that
+            // the tile database's trim passes stay cheap — at 600 MB the
+            // trim's SQLite churn was enough to make budget phones stutter.
+            tileFileSystemCacheMaxBytes = 250L * 1024 * 1024
+            tileFileSystemCacheTrimBytes = 200L * 1024 * 1024
             // Keep serving cached tiles long after their normal expiry — stale
             // roads beat a blank screen in a dead zone.
             expirationExtendedDuration = 30L * 24 * 60 * 60 * 1000

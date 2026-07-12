@@ -15,6 +15,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -44,26 +45,15 @@ class LiveKitTransport @Inject constructor(
     private val _participantLeft = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val participantLeft: SharedFlow<String> = _participantLeft
 
-    private var room: Room? = null
     private var payloadListener: PayloadListener? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    // The coroutine collecting the current room's events. Must die with the
-    // room — otherwise every reconnect leaks a collector plus the room's
-    // native WebRTC resources, and the app gets slower with every ride.
+    // ONE Room for the app's entire life, reconnected per session — the way
+    // the LiveKit SDK is designed to be used. Creating a Room per connection
+    // attempt (the old approach) allocates a full native WebRTC stack each
+    // time; those piled up across rides and reconnects until the app crawled.
+    @Volatile private var room: Room? = null
     private var eventsJob: Job? = null
-
-    /** Fully dispose a room: stop listening, disconnect, free native resources. */
-    private fun discardRoom(oldRoom: Room?) {
-        eventsJob?.cancel()
-        eventsJob = null
-        if (oldRoom != null) {
-            scope.launch {
-                runCatching { oldRoom.disconnect() }
-                runCatching { oldRoom.release() }
-            }
-        }
-    }
 
     // Remote audio tracks we control the playback volume of (slider + nav ducking).
     private val remoteAudioTracks = mutableSetOf<RemoteAudioTrack>()
@@ -78,6 +68,97 @@ class LiveKitTransport @Inject constructor(
     private var token: String = ""
     private var url: String = ""
 
+    /** The singleton room, created (with its event listener) on first use. */
+    private fun obtainRoom(): Room {
+        room?.let { return it }
+        synchronized(this) {
+            room?.let { return it }
+            val newRoom = LiveKit.create(context)
+            room = newRoom
+            eventsJob = scope.launch {
+                newRoom.events.collect { event -> handleRoomEvent(newRoom, event) }
+            }
+            return newRoom
+        }
+    }
+
+    private fun handleRoomEvent(room: Room, event: RoomEvent) {
+        when (event) {
+            is RoomEvent.Connected -> {
+                Log.d(TAG, "Connected to LiveKit room")
+                _state.value = TransportState.CONNECTED
+                scope.launch {
+                    try {
+                        // Respect the rider's mute state across reconnects.
+                        room.localParticipant.setMicrophoneEnabled(micDesiredEnabled)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to set mic: ${e.message}")
+                    }
+                }
+            }
+            is RoomEvent.FailedToConnect -> {
+                Log.e(TAG, "Failed to connect to LiveKit")
+                _state.value = TransportState.DISCONNECTED
+                if (shouldBeConnected) connectWithRetry()
+            }
+            is RoomEvent.Disconnected -> {
+                Log.d(TAG, "Disconnected from LiveKit: ${event.reason}")
+                // LiveKit's internal resume handles brief blips; if it gave up
+                // and we still want to be online, rebuild the connection.
+                _state.value = TransportState.DISCONNECTED
+                if (shouldBeConnected) connectWithRetry()
+            }
+            is RoomEvent.TrackSubscribed -> {
+                Log.d(TAG, "Subscribed to track from ${event.participant.identity?.value}")
+                val track = event.track
+                if (track is RemoteAudioTrack) {
+                    synchronized(remoteAudioTracks) { remoteAudioTracks.add(track) }
+                    // Apply the current intercom volume to the newly joined rider.
+                    runCatching { track.setVolume(currentVolume) }
+                }
+            }
+            is RoomEvent.TrackUnsubscribed -> {
+                val track = event.track
+                if (track is RemoteAudioTrack) {
+                    synchronized(remoteAudioTracks) { remoteAudioTracks.remove(track) }
+                }
+            }
+            is RoomEvent.ActiveSpeakersChanged -> {
+                val localId = room.localParticipant.identity?.value
+                _activeSpeakers.value = event.speakers
+                    .mapNotNull { it.identity?.value }
+                    .filter { it != localId }
+            }
+            is RoomEvent.DataReceived -> {
+                val senderId = event.participant?.identity?.value ?: "unknown"
+                val data = event.data
+                // The packet type travels in the LiveKit data "topic".
+                val rawTopic = event.topic ?: "LOCATION"
+                val forwarded = rawTopic.endsWith(FORWARDED_SUFFIX)
+                val typeName = rawTopic.removeSuffix(FORWARDED_SUFFIX)
+                val type = runCatching { PacketType.valueOf(typeName) }
+                    .getOrDefault(PacketType.LOCATION)
+                val packet = DataPacket(
+                    senderId = senderId,
+                    sessionId = sessionId,
+                    packetType = type,
+                    payload = data,
+                    forwarded = forwarded
+                )
+                payloadListener?.onDataPacketReceived(packet)
+            }
+            is RoomEvent.ParticipantConnected -> {
+                Log.d(TAG, "Participant joined: ${event.participant.identity?.value}")
+                _participantJoined.tryEmit(event.participant.identity?.value ?: "A rider")
+            }
+            is RoomEvent.ParticipantDisconnected -> {
+                Log.d(TAG, "Participant left: ${event.participant.identity?.value}")
+                _participantLeft.tryEmit(event.participant.identity?.value ?: "A rider")
+            }
+            else -> {}
+        }
+    }
+
     override fun start(sessionId: String, connectionToken: String, signalingUrl: String) {
         if (shouldBeConnected) return
         shouldBeConnected = true
@@ -91,18 +172,16 @@ class LiveKitTransport @Inject constructor(
         connectJob?.cancel()
         connectJob = scope.launch {
             var attempt = 0
-            while (shouldBeConnected && _state.value != TransportState.CONNECTED) {
+            while (isActive && shouldBeConnected && _state.value != TransportState.CONNECTED) {
                 attempt++
-                // Tear down any half-dead room from a previous attempt first.
-                room?.let { old ->
-                    room = null
-                    discardRoom(old)
-                }
                 _state.value = TransportState.CONNECTING
                 Log.d(TAG, "Connecting to LiveKit (attempt $attempt): url=$url")
                 try {
-                    connectOnce()
-                    return@launch
+                    val r = obtainRoom()
+                    // Clear any half-open state from a previous session/attempt.
+                    runCatching { r.disconnect() }
+                    r.connect(url, token)
+                    return@launch // the Connected event flips state
                 } catch (e: Exception) {
                     Log.e(TAG, "LiveKit connect failed: ${e.message}")
                     _state.value = TransportState.DISCONNECTED
@@ -115,107 +194,17 @@ class LiveKitTransport @Inject constructor(
         }
     }
 
-    private suspend fun connectOnce() {
-        val newRoom = LiveKit.create(context)
-        room = newRoom
-
-        eventsJob = scope.launch {
-            newRoom.events.collect { event ->
-                when (event) {
-                    is RoomEvent.Connected -> {
-                        Log.d(TAG, "Connected to LiveKit room")
-                        _state.value = TransportState.CONNECTED
-                        scope.launch {
-                            try {
-                                // Respect the rider's mute state across reconnects.
-                                newRoom.localParticipant.setMicrophoneEnabled(micDesiredEnabled)
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed to set mic: ${e.message}")
-                            }
-                        }
-                    }
-                    is RoomEvent.FailedToConnect -> {
-                        Log.e(TAG, "Failed to connect to LiveKit")
-                        // Ignore events from rooms we already replaced/abandoned.
-                        if (room === newRoom) {
-                            _state.value = TransportState.DISCONNECTED
-                            if (shouldBeConnected) connectWithRetry()
-                        }
-                    }
-                    is RoomEvent.Disconnected -> {
-                        Log.d(TAG, "Disconnected from LiveKit: ${event.reason}")
-                        // LiveKit's internal resume handles brief blips; if it gave up
-                        // and we still want to be online, rebuild the connection.
-                        if (room === newRoom) {
-                            _state.value = TransportState.DISCONNECTED
-                            if (shouldBeConnected) connectWithRetry()
-                        }
-                    }
-                    is RoomEvent.TrackSubscribed -> {
-                        Log.d(TAG, "Subscribed to track from ${event.participant.identity?.value}")
-                        val track = event.track
-                        if (track is RemoteAudioTrack) {
-                            synchronized(remoteAudioTracks) { remoteAudioTracks.add(track) }
-                            // Apply the current intercom volume to the newly joined rider.
-                            runCatching { track.setVolume(currentVolume) }
-                        }
-                    }
-                    is RoomEvent.TrackUnsubscribed -> {
-                        val track = event.track
-                        if (track is RemoteAudioTrack) {
-                            synchronized(remoteAudioTracks) { remoteAudioTracks.remove(track) }
-                        }
-                    }
-                    is RoomEvent.ActiveSpeakersChanged -> {
-                        val localId = newRoom.localParticipant.identity?.value
-                        _activeSpeakers.value = event.speakers
-                            .mapNotNull { it.identity?.value }
-                            .filter { it != localId }
-                    }
-                    is RoomEvent.DataReceived -> {
-                        val senderId = event.participant?.identity?.value ?: "unknown"
-                        val data = event.data
-                        // The packet type travels in the LiveKit data "topic".
-                        val rawTopic = event.topic ?: "LOCATION"
-                        val forwarded = rawTopic.endsWith(FORWARDED_SUFFIX)
-                        val typeName = rawTopic.removeSuffix(FORWARDED_SUFFIX)
-                        val type = runCatching { PacketType.valueOf(typeName) }
-                            .getOrDefault(PacketType.LOCATION)
-                        val packet = DataPacket(
-                            senderId = senderId,
-                            sessionId = sessionId,
-                            packetType = type,
-                            payload = data,
-                            forwarded = forwarded
-                        )
-                        payloadListener?.onDataPacketReceived(packet)
-                    }
-                    is RoomEvent.ParticipantConnected -> {
-                        Log.d(TAG, "Participant joined: ${event.participant.identity?.value}")
-                        _participantJoined.tryEmit(event.participant.identity?.value ?: "A rider")
-                    }
-                    is RoomEvent.ParticipantDisconnected -> {
-                        Log.d(TAG, "Participant left: ${event.participant.identity?.value}")
-                        _participantLeft.tryEmit(event.participant.identity?.value ?: "A rider")
-                    }
-                    else -> {}
-                }
-            }
-        }
-
-        newRoom.connect(url, token)
-    }
-
     override fun stop() {
         shouldBeConnected = false
         connectJob?.cancel()
         connectJob = null
         _state.value = TransportState.DISCONNECTED
-        val oldRoom = room
-        room = null
         synchronized(remoteAudioTracks) { remoteAudioTracks.clear() }
         _activeSpeakers.value = emptyList()
-        discardRoom(oldRoom)
+        // Disconnect but keep the Room instance (and its event listener) for
+        // the next ride — reuse is what prevents native-resource churn.
+        val r = room
+        scope.launch { runCatching { r?.disconnect() } }
     }
 
     /** Enable or disable the local microphone (intercom mute/unmute). */
