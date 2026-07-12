@@ -67,6 +67,8 @@ data class MapUiState(
     val recentDestinations: List<PlaceResult> = emptyList(),
     // A long-pressed map point the rider may want to ride to.
     val droppedPin: PlaceResult? = null,
+    // Bright high-contrast map for sunlight; dark for night/indoors.
+    val lightMap: Boolean = false,
     // Live ride statistics
     val rideStartTimeMillis: Long = 0L,
     val rideDistanceMeters: Double = 0.0,
@@ -97,7 +99,8 @@ class MapViewModel @Inject constructor(
     private val voiceGuidanceManager: VoiceGuidanceManager,
     private val navigationStatusHolder: NavigationStatusHolder,
     private val recentDestinationsStore: RecentDestinationsStore,
-    private val compassHeadingProvider: CompassHeadingProvider
+    private val compassHeadingProvider: CompassHeadingProvider,
+    private val mapStyleStore: MapStyleStore
 ) : ViewModel() {
 
     // Turn-by-turn guidance state
@@ -137,7 +140,19 @@ class MapViewModel @Inject constructor(
         observeLocationUpdates()
         observeIncomingRoutes()
         observeParticipantJoins()
-        _uiState.update { it.copy(recentDestinations = recentDestinationsStore.load()) }
+        _uiState.update {
+            it.copy(
+                recentDestinations = recentDestinationsStore.load(),
+                lightMap = mapStyleStore.lightMap
+            )
+        }
+    }
+
+    /** Flip between the dark map and the bright sunlight-readable one. */
+    fun toggleMapStyle() {
+        val light = !_uiState.value.lightMap
+        mapStyleStore.lightMap = light
+        _uiState.update { it.copy(lightMap = light) }
     }
 
     /** The map screen drives the compass with its own visibility. */
@@ -404,7 +419,9 @@ class MapViewModel @Inject constructor(
     fun dropPin(latitude: Double, longitude: Double) {
         val placeholder = PlaceResult(
             name = "Dropped pin",
-            description = "%.5f, %.5f".format(latitude, longitude),
+            // Locale-pinned: some locales print decimal commas, which reads
+            // as four numbers instead of one coordinate.
+            description = "%.5f, %.5f".format(java.util.Locale.US, latitude, longitude),
             latitude = latitude,
             longitude = longitude
         )
@@ -738,6 +755,8 @@ class MapViewModel @Inject constructor(
     fun setFollowingUser(following: Boolean) {
         // A deliberate un-follow (user pan) cancels any pending auto-refollow.
         if (!following) resumeFollowOnMove = false
+        // Touch gestures call this every frame — don't churn state needlessly.
+        if (_uiState.value.isFollowingUser == following) return
         _uiState.update { it.copy(isFollowingUser = following) }
     }
 

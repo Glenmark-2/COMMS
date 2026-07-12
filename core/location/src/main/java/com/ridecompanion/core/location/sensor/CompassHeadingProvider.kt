@@ -46,7 +46,8 @@ class CompassHeadingProvider @Inject constructor(
         if (started) return
         started = true
         smoothed = Float.NaN
-        sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_UI)
+        // GAME rate (~20 ms) — heading must feel instant on the handlebars.
+        sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
     }
 
     fun stop() {
@@ -73,20 +74,21 @@ class CompassHeadingProvider @Inject constructor(
         val azimuth = Math.toDegrees(orientation[0].toDouble()).toFloat()
         val heading = (azimuth + declinationDegrees + 360f) % 360f
 
-        // Wrap-aware exponential smoothing — kills sensor jitter without
-        // adding noticeable lag when the rider actually turns.
+        // Wrap-aware adaptive smoothing: barely moves on sensor jitter, but
+        // follows almost 1:1 on a real turn, so the map reacts instantly.
         smoothed = if (smoothed.isNaN()) {
             heading
         } else {
             var delta = heading - smoothed
             if (delta > 180f) delta -= 360f
             if (delta < -180f) delta += 360f
-            (smoothed + 0.25f * delta + 360f) % 360f
+            val alpha = (0.15f + abs(delta) / 60f).coerceAtMost(0.85f)
+            (smoothed + alpha * delta + 360f) % 360f
         }
 
-        // Only publish meaningful changes so collectors aren't spammed at 60 Hz.
+        // Only publish meaningful changes so collectors aren't spammed at 50 Hz.
         val current = _headingDegrees.value
-        if (current == null || angleDelta(current, smoothed) > 1.5f) {
+        if (current == null || angleDelta(current, smoothed) > 1.0f) {
             _headingDegrees.value = smoothed
         }
     }

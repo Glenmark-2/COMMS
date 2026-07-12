@@ -17,6 +17,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.DarkMode
+import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -42,7 +44,7 @@ import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Overlay
 import org.osmdroid.views.overlay.Polyline
-import org.osmdroid.views.overlay.gestures.RotationGestureOverlay
+import kotlin.math.atan2
 
 private const val TAG = "MapScreen"
 
@@ -54,9 +56,10 @@ private const val FREE_ZOOM = 16.5
 private const val GPS_COURSE_MIN_SPEED_MPS = 2.0f
 private const val CAMERA_ANIMATION_MS = 800L
 
-// CARTO dark retina raster tiles (keyless, OSM-based). osmdroid caches every
+// CARTO retina raster tiles (keyless, OSM-based). osmdroid caches every
 // downloaded tile on disk automatically, so anywhere you've ridden — plus the
 // pre-cached route corridor — keeps rendering with no internet.
+// Dark for night/indoor riding…
 private val CARTO_DARK = XYTileSource(
     "CartoDark2x",
     1, 19, 512, "@2x.png",
@@ -64,6 +67,19 @@ private val CARTO_DARK = XYTileSource(
         "https://a.basemaps.cartocdn.com/dark_all/",
         "https://b.basemaps.cartocdn.com/dark_all/",
         "https://c.basemaps.cartocdn.com/dark_all/"
+    ),
+    "© OpenStreetMap contributors © CARTO"
+)
+
+// …and bright, high-contrast Voyager for daylight, where a dark map washes
+// out completely in direct sun.
+private val CARTO_VOYAGER = XYTileSource(
+    "CartoVoyager2x",
+    1, 19, 512, "@2x.png",
+    arrayOf(
+        "https://a.basemaps.cartocdn.com/rastertiles/voyager/",
+        "https://b.basemaps.cartocdn.com/rastertiles/voyager/",
+        "https://c.basemaps.cartocdn.com/rastertiles/voyager/"
     ),
     "© OpenStreetMap contributors © CARTO"
 )
@@ -135,9 +151,14 @@ fun MapScreen(
                 map.mapOrientation = -lastBearing
                 map.controller.setCenter(here)
                 hasInitialZoom = true
-            } else {
+            } else if (location.speed >= GPS_COURSE_MIN_SPEED_MPS) {
                 // Course-up: the map rotates so your heading is always "up".
                 map.controller.animateTo(here, zoom, CAMERA_ANIMATION_MS, -lastBearing)
+            } else {
+                // Slow/stopped: the compass owns rotation (it writes the
+                // orientation directly). Animating rotation here too would
+                // rubber-band against it and make the heading feel laggy.
+                map.controller.animateTo(here, zoom, CAMERA_ANIMATION_MS)
             }
         }
         map.invalidate()
@@ -177,6 +198,19 @@ fun MapScreen(
                 cachedRouteKey = key
                 preCacheRouteCorridor(map, pts)
             }
+        }
+    }
+
+    // ---- Map style: dark for night, bright Voyager for sunlight ----
+    LaunchedEffect(uiState.lightMap, mapView) {
+        val map = mapView ?: return@LaunchedEffect
+        val ov = rideOverlays ?: return@LaunchedEffect
+        runCatching {
+            map.setTileSource(if (uiState.lightMap) CARTO_VOYAGER else CARTO_DARK)
+            ov.copyright?.setTextColor(
+                AColor.parseColor(if (uiState.lightMap) "#5A6270" else "#8A93A8")
+            )
+            map.invalidate()
         }
     }
 
@@ -323,9 +357,6 @@ fun MapScreen(
                     controller.setZoom(FREE_ZOOM)
 
                     val ov = RideOverlays(ctx, this)
-                    // Two-finger twist rotates the map freely while browsing;
-                    // recentering snaps back to course-up.
-                    overlays.add(RotationGestureOverlay(this).apply { isEnabled = true })
                     // Long-press anywhere to drop a pin and ride to it.
                     overlays.add(MapEventsOverlay(object : MapEventsReceiver {
                         override fun singleTapConfirmedHelper(p: GeoPoint?) = false
@@ -336,19 +367,46 @@ fun MapScreen(
                         }
                     }))
                     overlays.add(ov.puck)
-                    overlays.add(CopyrightOverlay(ctx).apply {
-                        setTextColor(AColor.parseColor("#8A93A8"))
+                    ov.copyright = CopyrightOverlay(ctx).apply {
                         setAlignBottom(true)
                         setOffset(12, 220)
-                    })
+                    }
+                    overlays.add(ov.copyright)
 
-                    // Any drag/pinch means the rider wants to look around —
-                    // stop auto-following until they tap recenter.
+                    // Touch handling, done by hand so it survives every device
+                    // and lifecycle quirk (osmdroid's RotationGestureOverlay
+                    // silently dies after view detach events):
+                    //  - any drag/pinch stops auto-following until recenter
+                    //  - a two-finger twist rotates the map
+                    var rotating = false
+                    var rotStartFingerAngle = 0f
+                    var rotStartMapOrientation = 0f
                     setOnTouchListener { v, event ->
-                        if (event.actionMasked == MotionEvent.ACTION_MOVE) {
-                            viewModel.setFollowingUser(false)
+                        when (event.actionMasked) {
+                            MotionEvent.ACTION_POINTER_DOWN -> {
+                                if (event.pointerCount == 2) {
+                                    rotating = true
+                                    rotStartFingerAngle = twoFingerAngle(event)
+                                    rotStartMapOrientation = mapOrientation
+                                }
+                            }
+                            MotionEvent.ACTION_MOVE -> {
+                                viewModel.setFollowingUser(false)
+                                if (rotating && event.pointerCount >= 2) {
+                                    var delta = twoFingerAngle(event) - rotStartFingerAngle
+                                    while (delta > 180f) delta -= 360f
+                                    while (delta < -180f) delta += 360f
+                                    mapOrientation = rotStartMapOrientation + delta
+                                }
+                            }
+                            MotionEvent.ACTION_POINTER_UP -> {
+                                if (event.pointerCount <= 2) rotating = false
+                            }
+                            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                rotating = false
+                                if (event.actionMasked == MotionEvent.ACTION_UP) v.performClick()
+                            }
                         }
-                        if (event.actionMasked == MotionEvent.ACTION_UP) v.performClick()
                         false
                     }
 
@@ -360,18 +418,16 @@ fun MapScreen(
             update = { _ -> }
         )
 
-        // Recenter button
-        AnimatedVisibility(
-            visible = !uiState.isFollowingUser,
-            enter = fadeIn(),
-            exit = fadeOut(),
+        // Map controls: day/night style toggle (always) + recenter (when unfollowed)
+        Column(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .navigationBarsPadding()
-                .padding(end = 16.dp, bottom = 96.dp)
+                .padding(end = 16.dp, bottom = 96.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
             IconButton(
-                onClick = { viewModel.setFollowingUser(true) },
+                onClick = { viewModel.toggleMapStyle() },
                 modifier = Modifier
                     .size(52.dp)
                     .clip(CircleShape)
@@ -379,11 +435,34 @@ fun MapScreen(
                     .border(1.dp, Color(0x3300E5FF), CircleShape)
             ) {
                 Icon(
-                    imageVector = Icons.Default.MyLocation,
-                    contentDescription = "Recenter on my location",
+                    imageVector = if (uiState.lightMap) Icons.Default.DarkMode else Icons.Default.LightMode,
+                    contentDescription = if (uiState.lightMap) "Switch to dark map" else "Switch to bright map for sunlight",
                     tint = Color(0xFF00E5FF),
                     modifier = Modifier.size(24.dp)
                 )
+            }
+
+            AnimatedVisibility(
+                visible = !uiState.isFollowingUser,
+                enter = fadeIn(),
+                exit = fadeOut()
+            ) {
+                IconButton(
+                    onClick = { viewModel.setFollowingUser(true) },
+                    modifier = Modifier
+                        .padding(top = 12.dp)
+                        .size(52.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xF20C0F1D))
+                        .border(1.dp, Color(0x3300E5FF), CircleShape)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.MyLocation,
+                        contentDescription = "Recenter on my location",
+                        tint = Color(0xFF00E5FF),
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
             }
         }
     }
@@ -436,7 +515,15 @@ private class RideOverlays(ctx: Context, map: MapView) {
 
     var destMarker: Marker? = null
     var pinMarker: Marker? = null
+    var copyright: CopyrightOverlay? = null
     val riderMarkers = mutableListOf<Marker>()
+}
+
+/** Angle of the line between the first two pointers, in degrees. */
+private fun twoFingerAngle(event: MotionEvent): Float {
+    val dx = (event.getX(1) - event.getX(0)).toDouble()
+    val dy = (event.getY(1) - event.getY(0)).toDouble()
+    return Math.toDegrees(atan2(dy, dx)).toFloat()
 }
 
 /**
